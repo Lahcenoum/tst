@@ -1,0 +1,25 @@
+#!/bin/bash
+
+# ========================================================================
+#  سكريبت لمراقبة وحذف حسابات SSH التي تتجاوز الحد المسموح به من الاتصالات
+# ========================================================================
+
+# البادئة الخاصة بأسماء المستخدمين الذين أنشأهم البوت
+USER_PREFIX="sshdatbot"
+# هذا المتغير يمكن تعديله بواسطة سكريبت التثبيت الرئيسي
+CONNECTION_LIMIT=2
+# ملف لتسجيل عمليات الحذف
+LOG_FILE="/home/ssh_bot/multilogin_deletions.log"
+
+# الحصول على قائمة المستخدمين الذين تجاوزوا الحد المسموح به
+# awk -v limit="$CONNECTION_LIMIT" '$1 > limit {print $2}': هي الطريقة الصحيحة لتمرير المتغير إلى awk
+for USERNAME in $(who | awk '{print $1}' | grep "^$USER_PREFIX" | sort | uniq -c | awk -v limit="$CONNECTION_LIMIT" '$1 > limit {print $2}'); do
+    # التأكد من أن المستخدم موجود قبل محاولة حذفه
+    if id "$USERNAME" &>/dev/null; then
+        echo "[ $(date) ] Deleting user $USERNAME for exceeding connection limit of $CONNECTION_LIMIT." >> "$LOG_FILE"
+        # حذف المستخدم والمجلد الرئيسي الخاص به
+        userdel -r "$USERNAME"
+    fi
+done
+
+exit 0
