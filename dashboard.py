@@ -2,10 +2,11 @@ import sqlite3
 import telegram
 import asyncio
 import subprocess
+import re
 from flask import Flask, render_template_string, request, redirect, url_for, flash, session, jsonify
 from datetime import date, timedelta, datetime
 
-#  مكتبة لمراقبة الموارد
+#  مكتبة جديدة لمراقبة الموارد
 import psutil
 
 # =================================================================================
@@ -15,6 +16,7 @@ import psutil
 TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
 DB_FILE = 'ssh_bot_users.db'
 DASHBOARD_PASSWORD = "admin"
+V2RAY_LOG_PATH = "/var/log/xray/access.log" # ⚠️ تأكد من صحة هذا المسار
 
 # --- إعدادات لوحة التحكم ---
 app = Flask(__name__)
@@ -44,10 +46,11 @@ def login_required(f):
     return wrap
 
 def get_system_stats():
-    """Gets CPU, RAM, and Disk stats."""
+    """Gets CPU, RAM, Disk, and Network stats."""
     cpu = psutil.cpu_percent(interval=1)
     ram = psutil.virtual_memory()
     disk = psutil.disk_usage('/')
+    net = psutil.net_io_counters()
     
     # تحويل البايت إلى جيجابايت
     gb = 1024 ** 3
@@ -60,6 +63,8 @@ def get_system_stats():
         'disk_percent': disk.percent,
         'disk_total': f"{disk.total / gb:.2f}",
         'disk_used': f"{disk.used / gb:.2f}",
+        'net_sent': f"{net.bytes_sent / gb:.2f}",
+        'net_recv': f"{net.bytes_recv / gb:.2f}",
     }
 
 def get_ssh_connections(username):
@@ -70,6 +75,44 @@ def get_ssh_connections(username):
         return int(result.stdout.strip())
     except Exception:
         return 0
+
+def get_v2ray_live_connections():
+    """Parses V2Ray log to count unique IPs per user in the last 2 minutes."""
+    connections = {}
+    try:
+        two_minutes_ago = datetime.now() - timedelta(minutes=2)
+        #  استخدام journalctl هو الطريقة الأحدث والأكثر موثوقية لقراءة سجلات xray
+        command = "journalctl -u xray -n 5000 --no-pager"
+        result = subprocess.run(command, shell=True, capture_output=True, text=True)
+        
+        for line in result.stdout.strip().split('\n'):
+            if "accepted" in line:
+                # استخراج البريد الإلكتروني (UUID) وعنوان IP
+                email_match = re.search(r'email:\s*(\S+)', line)
+                ip_match = re.search(r'(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}):\d+', line)
+                
+                # استخراج الوقت
+                time_str_match = re.search(r'(\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})', line)
+
+                if email_match and ip_match and time_str_match:
+                    log_time = datetime.strptime(f"{date.today().year} {time_str_match.group(1)}", "%Y %b %d %H:%M:%S")
+
+                    if log_time >= two_minutes_ago:
+                        email = email_match.group(1)
+                        ip = ip_match.group(1)
+                        
+                        if email not in connections:
+                            connections[email] = set()
+                        connections[email].add(ip)
+
+        # تحويل المجموعات إلى عدد
+        live_users = {email: len(ips) for email, ips in connections.items()}
+        return live_users
+
+    except Exception as e:
+        print(f"Error reading V2Ray log: {e}")
+        return {}
+
 
 # =================================================================================
 # 3. HTML Templates (تم تحديثها)
@@ -220,8 +263,8 @@ INDEX_HTML = """
         <p class="text-3xl font-bold text-white">{{ stats.new_today }}</p>
     </div>
     <div class="bg-gray-800 p-6 rounded-lg">
-        <h3 class="text-gray-400 text-lg">حسابات SSH</h3>
-        <p class="text-3xl font-bold text-white">{{ stats.ssh_accounts }}</p>
+        <h3 class="text-gray-400 text-lg">إجمالي الحسابات</h3>
+        <p class="text-xl font-bold text-white">SSH: {{ stats.ssh_accounts }} | V2Ray: {{ stats.v2ray_accounts }}</p>
     </div>
 </div>
 
@@ -250,6 +293,10 @@ INDEX_HTML = """
             </div>
             <p class="text-sm text-center mt-1">{{ system.disk_used }} / {{ system.disk_total }} GB</p>
         </div>
+    </div>
+    <div class="mt-4 border-t border-gray-700 pt-4">
+        <h4 class="text-gray-400">استهلاك الشبكة (منذ التشغيل)</h4>
+        <p class="text-white"><span class="font-bold">التنزيل:</span> {{ system.net_recv }} GB | <span class="font-bold">الرفع:</span> {{ system.net_sent }} GB</p>
     </div>
 </div>
 
@@ -319,7 +366,7 @@ USERS_HTML = """
                 <tr>
                     <th scope="col" class="px-6 py-3">معرف المستخدم</th>
                     <th scope="col" class="px-6 py-3">النقاط</th>
-                    <th scope="col" class="px-6 py-3">اتصالات SSH</th>
+                    <th scope="col" class="px-6 py-3">المتصلون حالياً</th>
                     <th scope="col" class="px-6 py-3">تاريخ الانضمام</th>
                     <th scope="col" class="px-6 py-3">الإجراءات</th>
                 </tr>
@@ -331,9 +378,13 @@ USERS_HTML = """
                     <td class="px-6 py-4" id="points-{{ user.id }}">{{ user.points }}</td>
                     <td class="px-6 py-4">
                         {% if user.ssh_conns > 0 %}
-                            <span class="bg-blue-600 text-white text-xs font-medium mr-2 px-2.5 py-0.5 rounded">{{ user.ssh_conns }}</span>
-                        {% else %}
-                            <span class="text-gray-500">0</span>
+                            <span class="bg-blue-600 text-white text-xs font-medium mr-2 px-2.5 py-0.5 rounded">SSH: {{ user.ssh_conns }}</span>
+                        {% endif %}
+                        {% if user.v2ray_conns > 0 %}
+                            <span class="bg-green-600 text-white text-xs font-medium mr-2 px-2.5 py-0.5 rounded">V2Ray: {{ user.v2ray_conns }}</span>
+                        {% endif %}
+                        {% if user.ssh_conns == 0 and user.v2ray_conns == 0 %}
+                            <span class="text-gray-500">لا يوجد</span>
                         {% endif %}
                     </td>
                     <td class="px-6 py-4">{{ user.date }}</td>
@@ -562,7 +613,7 @@ def index():
         message = request.form.get('message')
         uploaded_file = request.files.get('file')
 
-        if not message and not uploaded_file:
+        if not message and not uploaded_file.get('file'):
             flash('يجب كتابة رسالة أو رفع ملف على الأقل.', 'danger')
             return redirect(url_for('index'))
 
@@ -601,6 +652,7 @@ def index():
         'active_today': conn.execute("SELECT COUNT(*) FROM daily_activity WHERE last_seen_date = ?", (today,)).fetchone()[0],
         'new_today': conn.execute("SELECT COUNT(*) FROM users WHERE created_date = ?", (today,)).fetchone()[0],
         'ssh_accounts': conn.execute("SELECT COUNT(*) FROM ssh_accounts").fetchone()[0],
+        'v2ray_accounts': conn.execute("SELECT COUNT(*) FROM v2ray_accounts").fetchone()[0]
     }
     
     chart_labels, chart_data = [], []
@@ -623,6 +675,8 @@ def users_list():
     conn = db_connect()
     users_data = conn.execute('SELECT telegram_user_id, points, created_date FROM users ORDER BY points DESC').fetchall()
     
+    v2ray_connections = get_v2ray_live_connections()
+    
     users_list_with_conns = []
     for user in users_data:
         user_dict = dict(user)
@@ -632,12 +686,17 @@ def users_list():
         ssh_username = f"sshdatbot{user_id}"
         user_dict['ssh_conns'] = get_ssh_connections(ssh_username)
         
+        # Get V2Ray connections
+        v2ray_email = f"user-{user_id}"
+        user_dict['v2ray_conns'] = v2ray_connections.get(v2ray_email, 0)
+        
         # Reformat for template
         users_list_with_conns.append({
             'id': user_id,
             'points': user_dict['points'],
             'date': user_dict['created_date'],
             'ssh_conns': user_dict['ssh_conns'],
+            'v2ray_conns': user_dict['v2ray_conns']
         })
 
     conn.close()
@@ -736,4 +795,4 @@ def settings():
 # =================================================================================
 if __name__ == '__main__':
     print("Dashboard is running on http://0.0.0.0:5000")
-    app.run(host='0.0.0.0', port=50
+    app.run(host='0.0.0.0', port=5000)

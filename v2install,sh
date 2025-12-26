@@ -1,0 +1,234 @@
+#!/usr/bin/env bash
+# ---------------------------------------------------------------
+# V2Ray (Xray-core) VLESS + WS + TLS — Simplified Installer
+# Tested on Ubuntu 20.04/22.04/24.04 (root required)
+# ---------------------------------------------------------------
+
+set -euo pipefail
+
+red() { echo -e "\e[31m$*\e[0m"; }
+green() { echo -e "\e[32m$*\e[0m"; }
+yellow() { echo -e "\e[33m$*\e[0m"; }
+
+# --- Input: Ask for domain ---
+read -rp "[?] أدخل اسم الدومين الخاص بك (مثال: example.com): " DOMAIN
+if [[ -z ${DOMAIN} ]]; then
+    red "[خطأ] إدخال الدومين مطلوب."
+    exit 1
+fi
+
+# --- Auto-generate a random email ---
+EMAIL="admin@${DOMAIN}"
+WSPATH="/vless-ws" # Default WebSocket Path
+
+# --- Pre-flight checks ---
+if [[ $EUID -ne 0 ]]; then
+    red "[خطأ] يجب تشغيل السكربت بصلاحيات root (sudo)."
+    exit 1
+fi
+
+if lsof -iTCP:443 -sTCP:LISTEN >/dev/null 2>&1; then
+    red "[خطأ] المنفذ 443 مُستخدم حاليًا. أغلق الخدمة التي تستخدمه ثم أعد المحاولة."
+    exit 1
+fi
+if lsof -iTCP:80 -sTCP:LISTEN >/dev/null 2>&1; then
+    red "[خطأ] المنفذ 80 مُستخدم حاليًا. أغلق الخدمة التي تستخدمه ثم أعد المحاولة."
+    exit 1
+fi
+
+# --- Generate UUID ---
+if command -v uuidgen >/dev/null 2>&1; then
+    UUID=$(uuidgen)
+else
+    UUID=$(cat /proc/sys/kernel/random/uuid)
+fi
+
+# --- Packages ---
+yellow "[1/7] تحديث النظام وتثبيت الحزم…"
+apt-get update -y
+apt-get install -y curl wget unzip jq coreutils socat cron nginx ufw python3
+
+# --- Install Xray-core ---
+yellow "[2/7] تثبيت Xray-core…"
+bash <(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh) >/tmp/xray-install.log 2>&1 || {
+    red "فشل تثبيت Xray. راجع /tmp/xray-install.log"
+    exit 1
+}
+
+# --- Basic web root for ACME ---
+mkdir -p /var/www/html
+chown -R www-data:www-data /var/www/html
+
+# --- Temporary Nginx for ACME challenge on standard port 80 ---
+yellow "[3/7] إعداد Nginx المؤقت على المنفذ 80 لإصدار الشهادة…"
+cat >/etc/nginx/sites-available/xray_temp <<EOF
+server {
+    listen 80;
+    server_name ${DOMAIN};
+    root /var/www/html;
+    location /.well-known/acme-challenge/ {
+        alias /var/www/html/.well-known/acme-challenge/;
+    }
+}
+EOF
+
+ln -sf /etc/nginx/sites-available/xray_temp /etc/nginx/sites-enabled/xray_temp
+rm -f /etc/nginx/sites-enabled/default || true
+
+# --- Firewall for port 80 ---
+if command -v ufw >/dev/null 2>&1; then
+    ufw allow 80/tcp >/dev/null 2>&1 || true
+fi
+
+nginx -t && systemctl restart nginx
+
+# --- Install certbot and issue certificate ---
+yellow "[4/7] استصدار شهادة TLS…"
+apt-get install -y certbot
+certbot certonly --webroot -w /var/www/html -d "$DOMAIN" -m "$EMAIL" --agree-tos --no-eff-email -n || {
+    red "فشل إصدار الشهادة. تأكد أن الدومين يشير إلى IP هذا السيرفر وأن المنفذ 80 مفتوح."
+    exit 1
+}
+
+# --- Write Xray config ---
+yellow "[5/7] إنشاء إعدادات Xray…"
+cat >/usr/local/etc/xray/config.json <<XRAYCONF
+{
+  "log": {
+    "access": "/var/log/xray/access.log",
+    "error": "/var/log/xray/error.log",
+    "loglevel": "warning"
+  },
+  "api": {
+    "tag": "api",
+    "services": [
+      "HandlerService"
+    ]
+  },
+  "routing": {
+    "rules": [
+      {
+        "type": "field",
+        "inboundTag": [
+          "api"
+        ],
+        "outboundTag": "api"
+      }
+    ]
+  },
+  "inbounds": [
+    {
+      "listen": "127.0.0.1",
+      "port": 10085,
+      "protocol": "dokodemo-door",
+      "settings": {
+        "address": "127.0.0.1"
+      },
+      "tag": "api"
+    },
+    {
+      "port": 10000,
+      "listen": "127.0.0.1",
+      "protocol": "vless",
+      "tag": "vless-inbound",
+      "settings": {
+        "clients": [
+          {
+            "id": "${UUID}",
+            "email": "vless@${DOMAIN}"
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "ws",
+        "security": "none",
+        "wsSettings": {
+          "path": "${WSPATH}"
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    { "protocol": "freedom" },
+    { "protocol": "blackhole", "tag": "blocked" }
+  ]
+}
+XRAYCONF
+
+systemctl enable xray
+systemctl restart xray
+
+# --- Nginx HTTPS reverse proxy to Xray ---
+yellow "[6/7] إعداد Nginx النهائي للـ TLS والـ WS على المنفذ 443…"
+cat >/etc/nginx/sites-available/xray <<NGINX
+map \$http_upgrade \$connection_upgrade {
+    default upgrade;
+    '' close;
+}
+
+server {
+    listen 80;
+    server_name ${DOMAIN};
+    return 301 https://\$host\$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    server_name ${DOMAIN};
+
+    ssl_certificate /etc/letsencrypt/live/${DOMAIN}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${DOMAIN}/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers on;
+
+    root /var/www/html;
+    index index.html;
+
+    location ${WSPATH} {
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:10000;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \$connection_upgrade;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    }
+}
+NGINX
+
+ln -sf /etc/nginx/sites-available/xray /etc/nginx/sites-enabled/xray
+rm -f /etc/nginx/sites-enabled/xray_temp || true
+nginx -t && systemctl reload nginx
+
+# --- Final Firewall ---
+yellow "[7/7] ضبط الجدار الناري (UFW)…"
+if command -v ufw >/dev/null 2>&1; then
+    ufw allow 'OpenSSH' >/dev/null 2>&1 || true
+    ufw allow 443/tcp >/dev/null 2>&1 || true
+    ufw allow 80/tcp >/dev/null 2>&1 || true # Allow port 80 for HTTP->HTTPS redirect
+fi
+
+# --- Auto renew hook ---
+(crontab -l 2>/dev/null | grep -v certbot || true; echo "0 3 * * * certbot renew --quiet --post-hook 'systemctl reload nginx'") | crontab -
+
+# --- Output connection info ---
+VLESS_URL="vless://${UUID}@${DOMAIN}:443?encryption=none&security=tls&type=ws&host=${DOMAIN}&sni=${DOMAIN}&path=$(python3 -c "from urllib.parse import quote; print(quote('${WSPATH}'))")#VLESS-WS-TLS-${DOMAIN}"
+
+cat <<INFO
+
+==============================================
+تم التثبيت بنجاح ✅
+
+الدومين: ${DOMAIN}
+المسار (WS): ${WSPATH}
+UUID: ${UUID}
+
+رابط الإستيراد (VLESS):
+${VLESS_URL}
+
+==============================================
+INFO
+
+green "كل شيء تمام. استمتع!"
