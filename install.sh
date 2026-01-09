@@ -45,6 +45,7 @@ rm -rf "$PROJECT_DIR"
 echo -e "\n[1/15] 📦 تحديث النظام وتثبيت المتطلبات الأساسية..."
 apt-get update
 apt-get install -y git python3-venv python3-pip openssl sudo jq curl wget unzip coreutils socat cron nginx ufw
+pip install -r requirements.txt
 
 # 2. التأكد من أن خدمة cron تعمل
 echo -e "\n[2/15] ⏰ التأكد من تشغيل خدمة cron..."
