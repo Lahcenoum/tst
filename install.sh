@@ -56,6 +56,8 @@ green "  - ✅ خدمة cron تعمل الآن."
 echo -e "\n[3/15] 📥 استنساخ المشروع من GitHub..."
 git clone "$GIT_REPO_URL" "$PROJECT_DIR"
 cd "$PROJECT_DIR" || exit 1
+source venv/bin/activate
+pip install -r requirements.txt
 
 # 4. إدخال توكن البوت
 echo -e "\n[4/15] 🔑 إعداد توكن البوت..."
